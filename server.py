@@ -9,6 +9,7 @@ import glob
 import shutil
 import uuid
 import json
+import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from mcp.server.fastmcp import FastMCP
@@ -229,6 +230,263 @@ def run_ahk_script(script_content: str, timeout_seconds: int = 3, action_descrip
         }
     finally:
         os.remove(temp_path)
+
+
+@mcp.tool()
+def run_ahk_detached(
+    script_content: str,
+    action_description: str = "Detached Script Execution",
+    workspace: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Runs an AutoHotkey v2 script in detached mode (fire-and-forget).
+    Returns immediately with the process PID. The script runs independently
+    and will not be killed when the MCP tool returns.
+
+    Use this for: launching applications, GUI automation, long-running tasks,
+    or any script that may show user interfaces or take more than a few seconds.
+
+    AGENT PROTOCOL: You MUST pass the absolute path of the current active project 
+    to the 'workspace' parameter for proper history logging.
+    """
+    temp_path = _create_temp_ahk(script_content)
+    try:
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0  # SW_HIDE
+
+        process = subprocess.Popen(
+            [AHK_PATH, "/ErrorStdOut", temp_path],
+            startupinfo=startupinfo
+        )
+
+        output = {
+            "pid": process.pid,
+            "status": "started",
+            "message": f"Script launched with PID {process.pid}. It runs independently."
+        }
+        _log_action(script_content, "run_ahk_detached", action_description, output, workspace)
+        return output
+    except Exception as e:
+        return {
+            "pid": None,
+            "status": "error",
+            "message": f"Failed to launch script: {str(e)}"
+        }
+    # Note: temp_path intentionally not deleted — the detached process owns it now
+
+
+@mcp.tool()
+def get_all_controls(
+    win_title: str,
+    action_description: str = "Enumerate Controls",
+    workspace: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Enumerates ALL controls (ClassNN) and their text values from a target window.
+    Returns a map of ClassNN → value for every control in the window.
+
+    Use this to discover ClassNN identifiers for any window or sub-window.
+    Far more efficient than hovering with Window Spy — one call dumps everything.
+    """
+    script_content = f'''#Requires AutoHotkey v2.0
+#NoTrayIcon
+winTitle := "{win_title}"
+if !WinExist(winTitle) {{
+    FileAppend("ERROR: Window not found`n", "*")
+    ExitApp(1)
+}}
+controls := WinGetControls(winTitle)
+for ctrl in controls {{
+    try {{
+        text := ControlGetText(ctrl, winTitle)
+        ; Use || as field separator (pipes would conflict with AHK)
+        FileAppend(ctrl . "=" . text . "`n", "*")
+    }}
+}}
+'''
+
+    temp_path = _create_temp_ahk(script_content)
+    try:
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+
+        result = subprocess.run(
+            [AHK_PATH, "/ErrorStdOut", temp_path],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            encoding='utf-8',
+            errors='replace',
+            startupinfo=startupinfo
+        )
+
+        controls = {}
+        if result.returncode == 0 and result.stdout:
+            for line in result.stdout.strip().split('\n'):
+                if '=' in line and not line.startswith("ERROR"):
+                    parts = line.split('=', 1)
+                    if len(parts) == 2:
+                        controls[parts[0]] = parts[1]
+
+        output = {
+            "window": win_title,
+            "count": len(controls),
+            "controls": controls
+        }
+        _log_action(script_content, "get_all_controls", action_description, output, workspace)
+        return output
+    except subprocess.TimeoutExpired:
+        return {"window": win_title, "count": 0, "controls": {}, "error": "Timed out"}
+    except Exception as e:
+        return {"window": win_title, "count": 0, "controls": {}, "error": str(e)}
+    finally:
+        os.remove(temp_path)
+
+
+@mcp.tool()
+def check_pid(pid: int) -> Dict[str, Any]:
+    """
+    Check whether a process ID is still running, and its exit code if finished.
+    Useful for checking if a run_ahk_detached script has completed.
+    """
+    try:
+        if os.name == 'nt':
+            import ctypes
+            from ctypes import wintypes
+
+            SYNCHRONIZE = 0x00100000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+
+            if not handle:
+                return {"pid": pid, "running": False, "exit_code": None,
+                        "message": "Process not found (may have already exited)"}
+
+            exit_code = wintypes.DWORD()
+            kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+            kernel32.CloseHandle(handle)
+
+            if exit_code.value == STILL_ACTIVE:
+                return {"pid": pid, "running": True, "exit_code": None,
+                        "message": "Process is still running"}
+            else:
+                return {"pid": pid, "running": False, "exit_code": exit_code.value,
+                        "message": f"Process exited with code {exit_code.value}"}
+        else:
+            import signal
+            try:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid == 0:
+                    return {"pid": pid, "running": True, "exit_code": None}
+                else:
+                    exit_code = status >> 8 if os.WIFEXITED(status) else -status
+                    return {"pid": pid, "running": False, "exit_code": exit_code}
+            except ChildProcessError:
+                return {"pid": pid, "running": False, "exit_code": None}
+    except Exception as e:
+        return {"pid": pid, "running": None, "error": str(e)}
+
+
+@mcp.tool()
+def type_text(
+    keys: str,
+    win_title: str,
+    action_description: str = "Type Text",
+    workspace: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Activates a window and sends keystrokes to it.
+    Uses SetKeyDelay(50,50) for reliable delivery to legacy Win32 apps.
+
+    keys: AHK Send syntax (e.g. "!c", "{Down 4}", "Hello{Tab}World{Enter}")
+    """
+    script_content = f'''#Requires AutoHotkey v2.0
+#NoTrayIcon
+winTitle := "{win_title}"
+if !WinExist(winTitle) {{
+    FileAppend("ERROR: Window not found`n", "*")
+    ExitApp(1)
+}}
+WinActivate(winTitle)
+Sleep(400)
+SetKeyDelay(50, 50)
+Send("{keys}")
+Sleep(300)
+FileAppend("OK`n", "*")
+'''
+
+    temp_path = _create_temp_ahk(script_content)
+    try:
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+
+        result = subprocess.run(
+            [AHK_PATH, "/ErrorStdOut", temp_path],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            encoding='utf-8',
+            errors='replace',
+            startupinfo=startupinfo
+        )
+
+        success = result.returncode == 0 and "OK" in result.stdout
+        output = {
+            "success": success,
+            "keys": keys,
+            "window": win_title,
+            "exit_code": result.returncode
+        }
+        if not success:
+            output["stderr"] = result.stderr
+        _log_action(script_content, "type_text", action_description, output, workspace)
+        return output
+    except subprocess.TimeoutExpired:
+        return {"success": False, "keys": keys, "window": win_title, "error": "Timed out"}
+    except Exception as e:
+        return {"success": False, "keys": keys, "window": win_title, "error": str(e)}
+    finally:
+        os.remove(temp_path)
+
+
+@mcp.tool()
+def file_recent(file_path: str, max_age_seconds: int = 10) -> Dict[str, Any]:
+    """
+    Check if a file exists and was modified within max_age_seconds.
+    Useful for verifying that an export/generation step produced output.
+    """
+    try:
+        if not os.path.exists(file_path):
+            return {"exists": False, "path": file_path,
+                    "message": "File not found"}
+
+        mtime = os.path.getmtime(file_path)
+        age = time.time() - mtime
+
+        return {
+            "exists": True,
+            "path": file_path,
+            "size_bytes": os.path.getsize(file_path),
+            "modified": datetime.fromtimestamp(mtime).isoformat(),
+            "age_seconds": round(age, 2),
+            "recent": age <= max_age_seconds,
+            "message": f"File is {age:.1f}s old (threshold: {max_age_seconds}s)"
+        }
+    except Exception as e:
+        return {"exists": False, "path": file_path, "error": str(e)}
+
 
 @mcp.tool()
 def inspect_active_window(workspace: Optional[str] = None) -> Dict[str, str]:
