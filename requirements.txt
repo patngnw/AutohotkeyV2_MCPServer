@@ -1,4 +1,3 @@
 mcp
 fastmcp
 pathlib
-tkinter
